@@ -79,8 +79,8 @@ class FramingSpec extends StreamSpec {
     val baseTestSequences = List("", "foo", "hello world").map(ByteString(_))
 
     // Helper to simplify testing
-    def simpleLines(delimiter: String, maximumBytes: Int, allowTruncation: Boolean = true) =
-      Framing.delimiter(ByteString(delimiter), maximumBytes, allowTruncation).map(_.utf8String)
+    def simpleLines(delimiter: String, maximumBytes: Int, allowTruncation: Boolean = true, skipTooLongFrames: Boolean = false) =
+      Framing.delimiter(ByteString(delimiter), maximumBytes, allowTruncation, skipTooLongFrames).map(_.utf8String)
         .named("lineFraming")
 
     def completeTestSequences(delimiter: ByteString): immutable.Iterable[ByteString] =
@@ -100,6 +100,19 @@ class FramingSpec extends StreamSpec {
       }
     }
 
+    "work with various delimiters and test sequences while skipping too long frames" in {
+      for (delimiter ← delimiterBytes; _ ← 1 to 5) {
+        val testSequence = completeTestSequences(delimiter)
+        val f = Source(testSequence)
+          .map(_ ++ delimiter)
+          .via(rechunk)
+          .via(Framing.delimiter(delimiter, 4, skipTooLongFrames = true))
+          .runWith(Sink.seq)
+
+        f.futureValue should ===(testSequence.filter(_.length <= 4))
+      }
+    }
+
     "Respect maximum line settings" in {
       // The buffer will contain more than 1 bytes, but the individual frames are less
       Source.single(ByteString("a\nb\nc\nd\n"))
@@ -116,6 +129,11 @@ class FramingSpec extends StreamSpec {
         .via(simpleLines("\n", 2))
         .limit(100)
         .runWith(Sink.seq).failed.futureValue shouldBe a[FramingException]
+
+      Source.single(ByteString("a\naaa\nbb"))
+        .via(simpleLines("\n", 2, skipTooLongFrames = true))
+        .limit(100)
+        .runWith(Sink.seq).futureValue should ===(List("a", "bb"))
 
     }
 
