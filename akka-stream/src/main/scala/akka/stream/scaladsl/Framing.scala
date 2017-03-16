@@ -28,11 +28,12 @@ object Framing {
    * @param delimiter The byte sequence to be treated as the end of the frame.
    * @param allowTruncation If `false`, then when the last frame being decoded contains no valid delimiter this Flow
    *                        fails the stream instead of returning a truncated frame.
-   * @param maximumFrameLength The maximum length of allowed frames while decoding. If the maximum length is
-   *                           exceeded this Flow will fail the stream.
+   * @param maximumFrameLength The maximum length of allowed frames while decoding.
+   * @param skipTooLongFrames If `false`, then this Flow will fail the stream if a frame exceeds the maximum length.
+   *                          If `true`, a frame longer than the maximum length will be silently dropped.
    */
-  def delimiter(delimiter: ByteString, maximumFrameLength: Int, allowTruncation: Boolean = false): Flow[ByteString, ByteString, NotUsed] =
-    Flow[ByteString].via(new DelimiterFramingStage(delimiter, maximumFrameLength, allowTruncation))
+  def delimiter(delimiter: ByteString, maximumFrameLength: Int, allowTruncation: Boolean = false, skipTooLongFrames: Boolean = false): Flow[ByteString, ByteString, NotUsed] =
+    Flow[ByteString].via(new DelimiterFramingStage(delimiter, maximumFrameLength, allowTruncation, skipTooLongFrames))
       .named("delimiterFraming")
 
   /**
@@ -139,7 +140,7 @@ object Framing {
     }
   }
 
-  private class DelimiterFramingStage(val separatorBytes: ByteString, val maximumLineBytes: Int, val allowTruncation: Boolean)
+  private class DelimiterFramingStage(val separatorBytes: ByteString, val maximumLineBytes: Int, val allowTruncation: Boolean, val skipTooLongFrames: Boolean)
     extends GraphStage[FlowShape[ByteString, ByteString]] {
 
     val in = Inlet[ByteString]("DelimiterFramingStage.in")
@@ -153,6 +154,7 @@ object Framing {
       private val firstSeparatorByte = separatorBytes.head
       private var buffer = ByteString.empty
       private var nextPossibleMatch = 0
+      private var currentFrameTooLong = false
 
       override def onPush(): Unit = {
         buffer ++= grab(in)
@@ -184,12 +186,26 @@ object Framing {
       private def doParse(): Unit = {
         val possibleMatchPos = buffer.indexOf(firstSeparatorByte, from = nextPossibleMatch)
         if (possibleMatchPos > maximumLineBytes)
-          failStage(new FramingException(s"Read ${buffer.size} bytes " +
-            s"which is more than $maximumLineBytes without seeing a line terminator"))
-        else if (possibleMatchPos == -1) {
-          if (buffer.size > maximumLineBytes)
+          if (skipTooLongFrames) {
+            currentFrameTooLong = true
+            buffer = buffer.drop(possibleMatchPos).compact
+            nextPossibleMatch = 0
+            doParse()
+          } else {
             failStage(new FramingException(s"Read ${buffer.size} bytes " +
               s"which is more than $maximumLineBytes without seeing a line terminator"))
+          }
+        else if (possibleMatchPos == -1) {
+          if (buffer.size > maximumLineBytes)
+            if (skipTooLongFrames) {
+              currentFrameTooLong = true
+              buffer = ByteString.empty
+              nextPossibleMatch = 0
+              doParse()
+            } else {
+              failStage(new FramingException(s"Read ${buffer.size} bytes " +
+                s"which is more than $maximumLineBytes without seeing a line terminator"))
+            }
           else {
             // No matching character, we need to accumulate more bytes into the buffer
             nextPossibleMatch = buffer.size
@@ -202,14 +218,22 @@ object Framing {
           nextPossibleMatch = possibleMatchPos
           tryPull()
         } else if (buffer.slice(possibleMatchPos, possibleMatchPos + separatorBytes.size) == separatorBytes) {
-          // Found a match
-          val parsedFrame = buffer.slice(0, possibleMatchPos).compact
-          buffer = buffer.drop(possibleMatchPos + separatorBytes.size).compact
-          nextPossibleMatch = 0
-          if (isClosed(in) && buffer.isEmpty) {
-            push(out, parsedFrame)
-            completeStage()
-          } else push(out, parsedFrame)
+          if (currentFrameTooLong) {
+            // The current frame is too long and should be dropped
+            buffer = buffer.drop(possibleMatchPos + separatorBytes.size).compact
+            currentFrameTooLong = false
+            nextPossibleMatch = 0
+            doParse()
+          } else {
+            // Found a match
+            val parsedFrame = buffer.slice(0, possibleMatchPos).compact
+            buffer = buffer.drop(possibleMatchPos + separatorBytes.size).compact
+            nextPossibleMatch = 0
+            if (isClosed(in) && buffer.isEmpty) {
+              push(out, parsedFrame)
+              completeStage()
+            } else push(out, parsedFrame)
+          }
         } else {
           // possibleMatchPos was not actually a match
           nextPossibleMatch += 1
