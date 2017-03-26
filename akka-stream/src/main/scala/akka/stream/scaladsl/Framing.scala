@@ -6,11 +6,13 @@ package akka.stream.scaladsl
 import java.nio.ByteOrder
 
 import akka.NotUsed
+import akka.actor.ActorSystem
 import akka.stream.impl.Stages.DefaultAttributes
 import akka.stream.impl.fusing.GraphStages.SimpleLinearGraphStage
 import akka.stream.{ Attributes, FlowShape, Inlet, Outlet }
 import akka.stream.stage._
 import akka.util.{ ByteIterator, ByteString }
+import com.typesafe.config.Config
 
 import scala.annotation.tailrec
 
@@ -30,10 +32,14 @@ object Framing {
    *                        fails the stream instead of returning a truncated frame.
    * @param maximumFrameLength The maximum length of allowed frames while decoding. If the maximum length is
    *                           exceeded this Flow will fail the stream.
+   * @param framingSettings Settings object for framing
    */
-  def delimiter(delimiter: ByteString, maximumFrameLength: Int, allowTruncation: Boolean = false, skipTooLongFrames: Boolean = false): Flow[ByteString, ByteString, NotUsed] =
-    Flow[ByteString].via(new DelimiterFramingStage(delimiter, maximumFrameLength, allowTruncation, skipTooLongFrames))
+  def delimiter(delimiter: ByteString, maximumFrameLength: Int, allowTruncation: Boolean = false, framingSettings: Option[FramingSettings] = None)(implicit system: ActorSystem): Flow[ByteString, ByteString, NotUsed] = {
+
+    val settings = framingSettings getOrElse FramingSettings(system)
+    Flow[ByteString].via(new DelimiterFramingStage(delimiter, maximumFrameLength, allowTruncation, settings.skipTooLongFrames))
       .named("delimiterFraming")
+  }
 
   /**
    * Creates a Flow that decodes an incoming stream of unstructured byte chunks into a stream of frames, assuming that
@@ -321,5 +327,71 @@ object Framing {
       setHandlers(in, out, this)
     }
   }
+
+}
+
+object FramingSettings {
+
+  /**
+   * Create [[FramingSettings]] from individual settings (Scala).
+   */
+  def apply(skipTooLongFrames: Boolean) =
+    new FramingSettings(skipTooLongFrames)
+
+  /**
+   * Create [[FramingSettings]] from the settings of an [[akka.actor.ActorSystem]] (Scala).
+   */
+  def apply(system: ActorSystem): FramingSettings =
+    apply(system.settings.config.getConfig("akka.stream.framing"))
+
+  /**
+   * Create [[FramingSettings]] from a Config subsection (Scala).
+   */
+  def apply(config: Config): FramingSettings =
+    new FramingSettings(skipTooLongFrames = config.getBoolean("skip-too-long-frames"))
+
+  /**
+   * Create [[FramingSettings]] from individual settings (Java).
+   */
+  def create(skipTooLongFrames: Boolean) =
+    new FramingSettings(skipTooLongFrames)
+
+  /**
+   * Create [[FramingSettings]] from the settings of an [[akka.actor.ActorSystem]] (Java).
+   */
+  def create(system: ActorSystem): FramingSettings =
+    apply(system)
+
+  /**
+   * Create [[FramingSettings]] from a Config subsection (Java).
+   */
+  def create(config: Config): FramingSettings =
+    apply(config)
+
+}
+
+/**
+ * This class describes the configurable properties of the [[Framing]] object.
+ * Please refer to the `withX` methods for descriptions of the individual settings.
+ */
+final class FramingSettings private (val skipTooLongFrames: Boolean) {
+
+  private def copy(skipTooLongFrames: Boolean = this.skipTooLongFrames) =
+    new FramingSettings(skipTooLongFrames)
+
+  /**
+   * Enable to skip and drop silently too long frames.
+   */
+  def withSkipTooLongFrames(enable: Boolean): FramingSettings =
+    if (enable == this.skipTooLongFrames) this
+    else copy(skipTooLongFrames = enable)
+
+  override def equals(other: Any): Boolean = other match {
+    case s: FramingSettings ⇒
+      s.skipTooLongFrames == skipTooLongFrames
+    case _ ⇒ false
+  }
+
+  override def toString = s"FramingSettings($skipTooLongFrames)"
 
 }

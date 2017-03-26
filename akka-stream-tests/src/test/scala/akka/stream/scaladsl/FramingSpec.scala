@@ -79,8 +79,8 @@ class FramingSpec extends StreamSpec {
     val baseTestSequences = List("", "foo", "hello world").map(ByteString(_))
 
     // Helper to simplify testing
-    def simpleLines(delimiter: String, maximumBytes: Int, allowTruncation: Boolean = true, skipTooLongFrames: Boolean = false) =
-      Framing.delimiter(ByteString(delimiter), maximumBytes, allowTruncation, skipTooLongFrames).map(_.utf8String)
+    def simpleLines(delimiter: String, maximumBytes: Int, allowTruncation: Boolean = true, framingSettings: Option[FramingSettings] = None) =
+      Framing.delimiter(ByteString(delimiter), maximumBytes, allowTruncation, framingSettings).map(_.utf8String)
         .named("lineFraming")
 
     def completeTestSequences(delimiter: ByteString): immutable.Iterable[ByteString] =
@@ -106,7 +106,7 @@ class FramingSpec extends StreamSpec {
         val f = Source(testSequence)
           .map(_ ++ delimiter)
           .via(rechunk)
-          .via(Framing.delimiter(delimiter, 4, skipTooLongFrames = true))
+          .via(Framing.delimiter(delimiter, 4, framingSettings = Some(new FramingSettings().withSkipTooLongFrames(true))))
           .runWith(Sink.seq)
 
         f.futureValue should ===(testSequence.filter(_.length <= 4))
@@ -131,7 +131,7 @@ class FramingSpec extends StreamSpec {
         .runWith(Sink.seq).failed.futureValue shouldBe a[FramingException]
 
       Source.single(ByteString("a\naaa\nbb"))
-        .via(simpleLines("\n", 2, skipTooLongFrames = true))
+        .via(simpleLines("\n", 2, framingSettings = Some(new FramingSettings().withSkipTooLongFrames(true))))
         .limit(100)
         .runWith(Sink.seq).futureValue should ===(List("a", "bb"))
 
