@@ -6,11 +6,13 @@ package akka.stream.scaladsl
 import java.nio.ByteOrder
 
 import akka.NotUsed
+import akka.actor.ActorSystem
 import akka.stream.impl.Stages.DefaultAttributes
 import akka.stream.impl.fusing.GraphStages.SimpleLinearGraphStage
 import akka.stream.{ Attributes, FlowShape, Inlet, Outlet }
 import akka.stream.stage._
 import akka.util.{ ByteIterator, ByteString }
+import com.typesafe.config.Config
 
 import scala.annotation.tailrec
 
@@ -30,10 +32,14 @@ object Framing {
    *                        fails the stream instead of returning a truncated frame.
    * @param maximumFrameLength The maximum length of allowed frames while decoding. If the maximum length is
    *                           exceeded this Flow will fail the stream.
+   * @param framingSettings Settings object for framing
    */
-  def delimiter(delimiter: ByteString, maximumFrameLength: Int, allowTruncation: Boolean = false): Flow[ByteString, ByteString, NotUsed] =
-    Flow[ByteString].via(new DelimiterFramingStage(delimiter, maximumFrameLength, allowTruncation))
+  def delimiter(delimiter: ByteString, maximumFrameLength: Int, allowTruncation: Boolean = false, framingSettings: Option[FramingSettings] = None)(implicit system: ActorSystem): Flow[ByteString, ByteString, NotUsed] = {
+
+    val settings = framingSettings getOrElse FramingSettings(system)
+    Flow[ByteString].via(new DelimiterFramingStage(delimiter, maximumFrameLength, allowTruncation, settings.skipTooLongFrames))
       .named("delimiterFraming")
+  }
 
   /**
    * Creates a Flow that decodes an incoming stream of unstructured byte chunks into a stream of frames, assuming that
@@ -139,7 +145,7 @@ object Framing {
     }
   }
 
-  private class DelimiterFramingStage(val separatorBytes: ByteString, val maximumLineBytes: Int, val allowTruncation: Boolean)
+  private class DelimiterFramingStage(val separatorBytes: ByteString, val maximumLineBytes: Int, val allowTruncation: Boolean, val skipTooLongFrames: Boolean)
     extends GraphStage[FlowShape[ByteString, ByteString]] {
 
     val in = Inlet[ByteString]("DelimiterFramingStage.in")
@@ -153,6 +159,7 @@ object Framing {
       private val firstSeparatorByte = separatorBytes.head
       private var buffer = ByteString.empty
       private var nextPossibleMatch = 0
+      private var currentFrameTooLong = false
 
       override def onPush(): Unit = {
         buffer ++= grab(in)
@@ -184,12 +191,26 @@ object Framing {
       private def doParse(): Unit = {
         val possibleMatchPos = buffer.indexOf(firstSeparatorByte, from = nextPossibleMatch)
         if (possibleMatchPos > maximumLineBytes)
-          failStage(new FramingException(s"Read ${buffer.size} bytes " +
-            s"which is more than $maximumLineBytes without seeing a line terminator"))
-        else if (possibleMatchPos == -1) {
-          if (buffer.size > maximumLineBytes)
+          if (skipTooLongFrames) {
+            currentFrameTooLong = true
+            buffer = buffer.drop(possibleMatchPos).compact
+            nextPossibleMatch = 0
+            doParse()
+          } else {
             failStage(new FramingException(s"Read ${buffer.size} bytes " +
               s"which is more than $maximumLineBytes without seeing a line terminator"))
+          }
+        else if (possibleMatchPos == -1) {
+          if (buffer.size > maximumLineBytes)
+            if (skipTooLongFrames) {
+              currentFrameTooLong = true
+              buffer = ByteString.empty
+              nextPossibleMatch = 0
+              doParse()
+            } else {
+              failStage(new FramingException(s"Read ${buffer.size} bytes " +
+                s"which is more than $maximumLineBytes without seeing a line terminator"))
+            }
           else {
             // No matching character, we need to accumulate more bytes into the buffer
             nextPossibleMatch = buffer.size
@@ -202,14 +223,22 @@ object Framing {
           nextPossibleMatch = possibleMatchPos
           tryPull()
         } else if (buffer.slice(possibleMatchPos, possibleMatchPos + separatorBytes.size) == separatorBytes) {
-          // Found a match
-          val parsedFrame = buffer.slice(0, possibleMatchPos).compact
-          buffer = buffer.drop(possibleMatchPos + separatorBytes.size).compact
-          nextPossibleMatch = 0
-          if (isClosed(in) && buffer.isEmpty) {
-            push(out, parsedFrame)
-            completeStage()
-          } else push(out, parsedFrame)
+          if (currentFrameTooLong) {
+            // The current frame is too long and should be dropped
+            buffer = buffer.drop(possibleMatchPos + separatorBytes.size).compact
+            currentFrameTooLong = false
+            nextPossibleMatch = 0
+            doParse()
+          } else {
+            // Found a match
+            val parsedFrame = buffer.slice(0, possibleMatchPos).compact
+            buffer = buffer.drop(possibleMatchPos + separatorBytes.size).compact
+            nextPossibleMatch = 0
+            if (isClosed(in) && buffer.isEmpty) {
+              push(out, parsedFrame)
+              completeStage()
+            } else push(out, parsedFrame)
+          }
         } else {
           // possibleMatchPos was not actually a match
           nextPossibleMatch += 1
@@ -298,5 +327,71 @@ object Framing {
       setHandlers(in, out, this)
     }
   }
+
+}
+
+object FramingSettings {
+
+  /**
+   * Create [[FramingSettings]] from individual settings (Scala).
+   */
+  def apply(skipTooLongFrames: Boolean) =
+    new FramingSettings(skipTooLongFrames)
+
+  /**
+   * Create [[FramingSettings]] from the settings of an [[akka.actor.ActorSystem]] (Scala).
+   */
+  def apply(system: ActorSystem): FramingSettings =
+    apply(system.settings.config.getConfig("akka.stream.framing"))
+
+  /**
+   * Create [[FramingSettings]] from a Config subsection (Scala).
+   */
+  def apply(config: Config): FramingSettings =
+    new FramingSettings(skipTooLongFrames = config.getBoolean("skip-too-long-frames"))
+
+  /**
+   * Create [[FramingSettings]] from individual settings (Java).
+   */
+  def create(skipTooLongFrames: Boolean) =
+    new FramingSettings(skipTooLongFrames)
+
+  /**
+   * Create [[FramingSettings]] from the settings of an [[akka.actor.ActorSystem]] (Java).
+   */
+  def create(system: ActorSystem): FramingSettings =
+    apply(system)
+
+  /**
+   * Create [[FramingSettings]] from a Config subsection (Java).
+   */
+  def create(config: Config): FramingSettings =
+    apply(config)
+
+}
+
+/**
+ * This class describes the configurable properties of the [[Framing]] object.
+ * Please refer to the `withX` methods for descriptions of the individual settings.
+ */
+final class FramingSettings private (val skipTooLongFrames: Boolean) {
+
+  private def copy(skipTooLongFrames: Boolean = this.skipTooLongFrames) =
+    new FramingSettings(skipTooLongFrames)
+
+  /**
+   * Enable to skip and drop silently too long frames.
+   */
+  def withSkipTooLongFrames(enable: Boolean): FramingSettings =
+    if (enable == this.skipTooLongFrames) this
+    else copy(skipTooLongFrames = enable)
+
+  override def equals(other: Any): Boolean = other match {
+    case s: FramingSettings ⇒
+      s.skipTooLongFrames == skipTooLongFrames
+    case _ ⇒ false
+  }
+
+  override def toString = s"FramingSettings($skipTooLongFrames)"
 
 }
